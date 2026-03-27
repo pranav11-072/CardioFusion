@@ -1,3 +1,4 @@
+import os
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
@@ -6,14 +7,20 @@ import logging
 import time
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.config["SECRET_KEY"] = "dev"
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///../cardiofusion.db"
+
+# FIX 1: Load SECRET_KEY from environment variable, fall back to a random key (never hardcoded "dev")
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", os.urandom(24))
+
+# FIX 2: Use an absolute path for the DB so it always resolves to the repo root
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{os.path.join(BASE_DIR, 'cardiofusion.db')}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 db.init_app(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
 
 class Pacemaker:
     def __init__(self):
@@ -22,10 +29,8 @@ class Pacemaker:
         self.last_pace_time = 0
         self.last_intrinsic_time = 0
         self.v_interval = 60000 / self.lrl
-        
         self.patient_hr = 45
         self.patient_interval = 60000 / self.patient_hr
-        
         self.current_hr = self.lrl
         self.pacing_state = 'IDLE'
 
@@ -35,7 +40,7 @@ class Pacemaker:
         self.v_interval = 60000 / self.lrl
 
     def set_patient_hr(self, hr):
-        if hr > 30 and hr < 200:
+        if 30 < hr < 200:
             self.patient_hr = hr
             self.patient_interval = 60000 / self.patient_hr
 
@@ -47,10 +52,15 @@ class Pacemaker:
         egm_value = 0.0
         event = 'NONE'
 
-        if time_since_last_intrinsic > self.patient_interval:
+        # FIX 3: Capture the intrinsic flag BEFORE resetting last_intrinsic_time,
+        # so the subsequent pacing check uses the correct (non-zero) elapsed value.
+        intrinsic_fired = time_since_last_intrinsic > self.patient_interval
+
+        if intrinsic_fired:
             self.last_intrinsic_time = current_time
+            # Recompute from the updated reference so downstream checks are accurate
             time_since_last_intrinsic = 0
-            
+
             if self.mode == "VVI" and time_since_last_pace < self.v_interval:
                 self.current_hr = self.patient_hr
                 event = 'INTRINSIC'
@@ -60,11 +70,14 @@ class Pacemaker:
 
         if self.mode == "VVI":
             if time_since_last_pace > self.v_interval:
-                if time_since_last_intrinsic > 200:
+                # FIX 3 (cont.): Use `intrinsic_fired` instead of the reset
+                # time_since_last_intrinsic (which was just set to 0 above).
+                # We want to pace only if no intrinsic beat just occurred.
+                if not intrinsic_fired:
                     self.last_pace_time = current_time
                     self.current_hr = self.lrl
                     event = 'VPACE'
-        
+
         if event == 'VPACE':
             ecg_value = 1.0
             egm_value = -0.8
@@ -73,7 +86,7 @@ class Pacemaker:
             ecg_value = 0.8
             egm_value = 0.6
             self.pacing_state = 'VSENSE'
-        
+
         return {
             'ecg': ecg_value,
             'egm': egm_value,
@@ -84,43 +97,46 @@ class Pacemaker:
             'event': event
         }
 
+
 pacer = Pacemaker()
 active_patient = None
 
+
 def simulator_loop():
     global active_patient
-    
+
+    # FIX 4: Single app context wrapping the entire loop — no nested context inside.
     with app.app_context():
         if not active_patient:
             active_patient = Patient.query.first()
-            if not active_patient:
-                active_patient = Patient(name="Default Patient")
-                db.session.add(active_patient)
-                db.session.commit()
+        if not active_patient:
+            active_patient = Patient(name="Default Patient")
+            db.session.add(active_patient)
+            db.session.commit()
 
-    while True:
-        current_time_ms = int(time.time() * 1000)
-        vitals = pacer.update(current_time_ms)
-        
-        socketio.emit('vitals_update', vitals)
-        
-        if vitals['event'] != 'NONE':
-            with app.app_context():
+        while True:
+            current_time_ms = int(time.time() * 1000)
+            vitals = pacer.update(current_time_ms)
+            socketio.emit('vitals_update', vitals)
+
+            if vitals['event'] != 'NONE':
+                # No nested with app.app_context() — we're already inside one
                 new_vital = Vitals(
-                    hr=vitals['hr'], 
-                    mode=vitals['mode'], 
+                    hr=vitals['hr'],
+                    mode=vitals['mode'],
                     lrl=vitals['lrl'],
                     patient_id=active_patient.id
                 )
                 db.session.add(new_vital)
                 db.session.commit()
 
-        socketio.sleep(0.05)
+            socketio.sleep(0.05)
 
 
 @app.route("/")
 def index():
     return render_template("index.html")
+
 
 @socketio.on("connect")
 def handle_connect():
@@ -129,9 +145,11 @@ def handle_connect():
         active_patient = Patient.query.first()
     emit("server_msg", {"msg": "Server ready ✅"})
 
+
 @socketio.on("hello_server")
 def on_hello(data):
-    emit("server_msg", {"msg": f"Hello back, {data.get('name','client')}!"})
+    emit("server_msg", {"msg": f"Hello back, {data.get('name', 'client')}!"})
+
 
 @socketio.on("ppg_data")
 def handle_ppg(data):
@@ -139,10 +157,12 @@ def handle_ppg(data):
     pacer.set_patient_hr(hr)
     socketio.emit("hr_update", data)
 
+
 @socketio.on("set_params")
 def on_set_params(data):
     pacer.set_params(data)
     emit("server_msg", {"msg": f"Params set: LRL={data['lrl']}, Mode={data['mode']}"})
+
 
 if __name__ == "__main__":
     with app.app_context():
@@ -150,7 +170,8 @@ if __name__ == "__main__":
         if not Patient.query.first():
             db.session.add(Patient(name="Default Patient"))
             db.session.commit()
-    
+
     socketio.start_background_task(simulator_loop)
     print("Starting CardioFusion server at http://127.0.0.1:5000 ...")
-    socketio.run(app, host="127.0.0.1", port=5000, debug=True, allow_unsafe_werkzeug=True, use_reloader=False)
+    socketio.run(app, host="127.0.0.1", port=5000, debug=True,
+                 allow_unsafe_werkzeug=True, use_reloader=False)
