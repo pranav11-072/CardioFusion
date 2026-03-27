@@ -1,0 +1,35 @@
+# FIX 6: Ignore the SQLite database — never commit binary DB files
+*.db
+*.sqlite
+*.sqlite3
+
+# FIX 7: Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# FIX 8: Environment variable files (contain secrets like SECRET_KEY)
+.env
+.env.*
+!.env.example
+
+# Flask / werkzeug
+instance/
+.flask_session/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
